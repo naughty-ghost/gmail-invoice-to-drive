@@ -30,6 +30,20 @@ const CONFIG = {
   // {sender}: 送信者名
   // {original}: 元のファイル名
   FILE_NAME_FORMAT: "{date}_{original}",
+
+  // さくらインターネット請求書のテキストファイル保存設定
+  SAKURA: {
+    // さくらインターネットからのメールアドレス（例: noreply@secure.sakura.ad.jp）
+    SENDER_EMAIL: "noreply@secure.sakura.ad.jp",
+    // テキストファイルとして保存するか
+    SAVE_AS_TEXT: true,
+    // テキストファイル名の形式
+    // {date}: 受信日 (YYYY-MM-DD)
+    // {subject}: メール件名
+    // {sender}: 送信者名
+    // {billno}: 請求書番号
+    TEXT_FILE_NAME_FORMAT: "{date}_sakura_invoice_{billno}.txt",
+  },
 };
 
 // ========== メイン関数 ==========
@@ -68,11 +82,57 @@ function saveInvoicesToDrive() {
       messages.forEach(function (message) {
         // 既に処理済みかチェック
         if (isProcessed(message, processedLabel)) {
+          Logger.log(
+            "⏭ スキップ（処理済み）: " +
+              message.getSubject() +
+              " from " +
+              message.getFrom(),
+          );
           return; // スキップ
         }
 
+        let savedCount = 0;
+
+        // メール情報をログ出力
+        const sender = message.getFrom();
+        Logger.log("----------------------------------------");
+        Logger.log("📧 メール処理中:");
+        Logger.log("  件名: " + message.getSubject());
+        Logger.log("  送信者: " + sender);
+        Logger.log("  受信日: " + message.getDate());
+
+        // さくらインターネットからのメールかチェック
+        const isSakuraMail = sender.indexOf(CONFIG.SAKURA.SENDER_EMAIL) !== -1;
+        Logger.log(
+          "  さくらインターネット判定: " +
+            (isSakuraMail ? "○ 該当" : "× 非該当"),
+        );
+
+        if (CONFIG.SAKURA.SAVE_AS_TEXT && isSakuraMail) {
+          // さくらインターネット請求書をテキストファイルとして保存
+          Logger.log("  → さくらインターネット請求書情報を抽出中...");
+          const invoiceInfo = extractSakuraInvoiceInfo(message);
+
+          if (invoiceInfo) {
+            Logger.log("  → 抽出成功:");
+            Logger.log("     会員ID: " + (invoiceInfo.memberId || "なし"));
+            Logger.log("     請求書番号: " + invoiceInfo.billNo);
+            Logger.log("     請求合計額: " + (invoiceInfo.amount || "なし"));
+
+            if (saveSakuraInvoiceAsText(invoiceInfo, folder)) {
+              savedCount++;
+              Logger.log(
+                "✓ さくらインターネット請求書を保存: 請求書番号 " +
+                  invoiceInfo.billNo,
+              );
+            }
+          } else {
+            Logger.log("  ⚠ 請求書情報の抽出に失敗しました");
+          }
+        }
+
         // PDF添付ファイルを保存
-        const savedCount = savePdfAttachments(message, folder);
+        savedCount += savePdfAttachments(message, folder);
 
         if (savedCount > 0) {
           // 処理済みラベルを付ける
@@ -217,6 +277,129 @@ function generateFileName(message, attachment) {
   }
 
   return fileName;
+}
+
+// ========== さくらインターネット請求書処理 ==========
+
+/**
+ * さくらインターネットのメール本文から請求書情報を抽出
+ * @param {GmailMessage} message - Gmailメッセージオブジェクト
+ * @return {Object|null} 抽出した請求書情報、または抽出失敗時はnull
+ */
+function extractSakuraInvoiceInfo(message) {
+  try {
+    const body = message.getPlainBody();
+
+    // 会員IDを抽出
+    const memberIdMatch = body.match(/会員ID\s*[:：]\s*([a-zA-Z0-9]+)/);
+    const memberId = memberIdMatch ? memberIdMatch[1] : null;
+
+    // 請求書番号を抽出
+    const billNoMatch = body.match(/請求書番号\s*[:：]\s*(\d+)/);
+    const billNo = billNoMatch ? billNoMatch[1] : null;
+
+    // 請求合計額を抽出
+    const amountMatch = body.match(/請求合計額\s*[:：]\s*([\d,]+)\s*円/);
+    const amount = amountMatch ? amountMatch[1] : null;
+
+    // 必須情報が揃っているかチェック
+    if (!billNo) {
+      Logger.log("⚠ さくらインターネット請求書番号が見つかりませんでした");
+      return null;
+    }
+
+    return {
+      memberId: memberId,
+      billNo: billNo,
+      amount: amount,
+      date: Utilities.formatDate(
+        message.getDate(),
+        Session.getScriptTimeZone(),
+        "yyyy-MM-dd",
+      ),
+      subject: message.getSubject(),
+      body: body,
+    };
+  } catch (error) {
+    Logger.log(
+      "さくらインターネット請求書情報の抽出エラー: " + error.toString(),
+    );
+    return null;
+  }
+}
+
+/**
+ * さくらインターネット請求書情報をテキストファイルとして保存
+ * @param {Object} invoiceInfo - extractSakuraInvoiceInfo関数で抽出した請求書情報
+ * @param {Folder} folder - 保存先フォルダ
+ * @return {boolean} 保存成功時はtrue、失敗時はfalse
+ */
+function saveSakuraInvoiceAsText(invoiceInfo, folder) {
+  try {
+    // ファイル名を生成
+    const subject = invoiceInfo.subject.replace(/[\\/:*?"<>|]/g, "_"); // 無効な文字を置換
+    const sender = "sakura"; // さくらインターネット固定
+
+    let fileName = CONFIG.SAKURA.TEXT_FILE_NAME_FORMAT.replace(
+      "{date}",
+      invoiceInfo.date,
+    )
+      .replace("{subject}", subject)
+      .replace("{sender}", sender)
+      .replace("{billno}", invoiceInfo.billNo);
+
+    // .txtが拡張子に含まれていない場合は追加
+    if (!fileName.toLowerCase().endsWith(".txt")) {
+      fileName += ".txt";
+    }
+
+    // 既に同じ名前のファイルが存在するかチェック
+    const existingFiles = folder.getFilesByName(fileName);
+    if (existingFiles.hasNext()) {
+      Logger.log("⚠ スキップ（既存）: " + fileName);
+      return false;
+    }
+
+    // テキストファイル内容を生成
+    const content =
+      "さくらインターネット請求書\n" +
+      "================================\n" +
+      "\n" +
+      "受信日: " +
+      invoiceInfo.date +
+      "\n" +
+      "件名: " +
+      invoiceInfo.subject +
+      "\n" +
+      "\n" +
+      "--------------------------------\n" +
+      "請求書情報\n" +
+      "--------------------------------\n" +
+      (invoiceInfo.memberId ? "会員ID: " + invoiceInfo.memberId + "\n" : "") +
+      "請求書番号: " +
+      invoiceInfo.billNo +
+      "\n" +
+      (invoiceInfo.amount
+        ? "請求合計額: " + invoiceInfo.amount + " 円（消費税含）\n"
+        : "") +
+      "\n" +
+      "--------------------------------\n" +
+      "メール本文（全文）\n" +
+      "--------------------------------\n" +
+      invoiceInfo.body;
+
+    // ファイルを作成して保存
+    const file = folder.createFile(fileName, content, MimeType.PLAIN_TEXT);
+    Logger.log("  → 保存: " + fileName);
+
+    return true;
+  } catch (error) {
+    Logger.log(
+      "さくらインターネット請求書のテキストファイル保存エラー: " +
+        error.toString(),
+    );
+    return false;
+  }
 }
 
 // ========== セットアップ関数 ==========
